@@ -19,6 +19,10 @@ export default {
 			}
 		},
 		extend: {
+			fontFamily: {
+				sans: ['Space Grotesk Variable', 'Space Grotesk', 'system-ui', 'sans-serif'],
+				pixel: ['"Press Start 2P"', 'monospace'],
+			},
 			colors: {
 				border: 'hsl(var(--border))',
 				input: 'hsl(var(--input))',
