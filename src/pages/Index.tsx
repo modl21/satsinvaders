@@ -1,8 +1,7 @@
 import { useState, useCallback, useRef } from 'react';
 import { useSeoMeta } from '@unhead/react';
 import { Zap, Gamepad2, Smartphone, Keyboard } from 'lucide-react';
-import { NSecSigner } from '@nostrify/nostrify';
-import { generateSecretKey } from 'nostr-tools';
+import type { NSecSigner } from '@nostrify/nostrify';
 
 import { Button } from '@/components/ui/button';
 import { GameCanvas } from '@/components/GameCanvas';
@@ -12,6 +11,7 @@ import { WeeklyWinnerBanner } from '@/components/WeeklyWinnerBanner';
 import { GameOverOverlay } from '@/components/GameOverOverlay';
 import { usePublishScore } from '@/hooks/usePublishScore';
 import type { GamePhase } from '@/lib/gameTypes';
+import type { GameInvoice } from '@/lib/lightning';
 
 const Index = () => {
   useSeoMeta({
@@ -30,16 +30,13 @@ const Index = () => {
     setShowPayment(true);
   }, []);
 
-  const handlePaid = useCallback((address: string) => {
+  const handlePaid = useCallback((address: string, gameInvoice: GameInvoice) => {
     setLightningAddress(address);
     setShowPayment(false);
     setPhase('playing');
 
-    // Create an ephemeral signer for publishing the score
-    if (!signerRef.current) {
-      const sk = generateSecretKey();
-      signerRef.current = new NSecSigner(sk);
-    }
+    // Reuse the ephemeral signer from the invoice (already created for zap request)
+    signerRef.current = gameInvoice.signer;
   }, []);
 
   const handleGameOver = useCallback(async (score: number) => {

@@ -1,23 +1,27 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { Zap, Copy, Check, Loader2 } from 'lucide-react';
+import { useNostr } from '@nostrify/react';
 import qrcode from 'qrcode';
 
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog';
+import { useAppContext } from '@/hooks/useAppContext';
 import { PAYMENT_AMOUNT_SATS, PAYMENT_RECIPIENT } from '@/lib/gameConstants';
 import { getGameInvoice, isWebLNAvailable, payWithWebLN, checkPaymentSettled } from '@/lib/lightning';
 import type { GameInvoice } from '@/lib/lightning';
 
 interface PaymentGateProps {
   open: boolean;
-  onPaid: (lightningAddress: string) => void;
+  onPaid: (lightningAddress: string, invoice: GameInvoice) => void;
   onClose: () => void;
 }
 
 const POLL_INTERVAL_MS = 2000;
 
 export function PaymentGate({ open, onPaid, onClose }: PaymentGateProps) {
+  const { nostr } = useNostr();
+  const { config } = useAppContext();
   const [lightningAddress, setLightningAddress] = useState('');
   const [step, setStep] = useState<'address' | 'invoice'>('address');
   const [invoice, setInvoice] = useState<GameInvoice | null>(null);
@@ -25,17 +29,19 @@ export function PaymentGate({ open, onPaid, onClose }: PaymentGateProps) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [copied, setCopied] = useState(false);
-  const [polling, setPolling] = useState(false);
+  const [verifying, setVerifying] = useState(false);
 
-  // Refs to avoid stale closures in the polling loop
-  const pollingRef = useRef(false);
-  const cancelledRef = useRef(false);
+  // Refs for polling/subscription lifecycle
+  const activeRef = useRef(false);
+  const abortRef = useRef<AbortController | null>(null);
 
-  // Stop any active polling
-  const stopPolling = useCallback(() => {
-    pollingRef.current = false;
-    cancelledRef.current = true;
-    setPolling(false);
+  const stopVerification = useCallback(() => {
+    activeRef.current = false;
+    if (abortRef.current) {
+      abortRef.current.abort();
+      abortRef.current = null;
+    }
+    setVerifying(false);
   }, []);
 
   // Reset when dialog opens/closes
@@ -47,54 +53,104 @@ export function PaymentGate({ open, onPaid, onClose }: PaymentGateProps) {
       setError('');
       setCopied(false);
       setLoading(false);
-      setPolling(false);
-      pollingRef.current = false;
-      cancelledRef.current = false;
+      setVerifying(false);
+      activeRef.current = false;
     } else {
-      stopPolling();
+      stopVerification();
     }
-  }, [open, stopPolling]);
+  }, [open, stopVerification]);
 
   // Cleanup on unmount
   useEffect(() => {
     return () => {
-      pollingRef.current = false;
-      cancelledRef.current = true;
+      activeRef.current = false;
+      if (abortRef.current) {
+        abortRef.current.abort();
+      }
     };
   }, []);
 
-  // Polling loop using recursive setTimeout for better control
-  const startPolling = useCallback((verifyUrl: string, address: string) => {
-    stopPolling();
-    cancelledRef.current = false;
-    pollingRef.current = true;
-    setPolling(true);
+  /**
+   * Start watching for payment using the best available method:
+   * 1. NIP-57 zap receipt subscription (if zap request was created)
+   * 2. LUD-21 verify URL polling (if verify URL returned)
+   * Both run concurrently if both are available.
+   */
+  const startVerification = useCallback((gameInvoice: GameInvoice, address: string) => {
+    stopVerification();
+    activeRef.current = true;
+    setVerifying(true);
 
-    async function poll() {
-      // Check if we should still be polling
-      if (!pollingRef.current || cancelledRef.current) return;
+    const abort = new AbortController();
+    abortRef.current = abort;
 
-      try {
-        const settled = await checkPaymentSettled(verifyUrl);
-        if (settled && pollingRef.current && !cancelledRef.current) {
-          pollingRef.current = false;
-          setPolling(false);
-          onPaid(address);
-          return;
+    const onSettled = () => {
+      if (!activeRef.current) return;
+      activeRef.current = false;
+      stopVerification();
+      onPaid(address, gameInvoice);
+    };
+
+    // Method 1: NIP-57 zap receipt subscription
+    if (gameInvoice.zapRequest && gameInvoice.recipientLnurlPubkey) {
+      const zapRequestId = gameInvoice.zapRequest.id;
+      const lnurlPubkey = gameInvoice.recipientLnurlPubkey;
+
+      (async () => {
+        try {
+          // Subscribe to zap receipts from the LNURL server's nostr pubkey
+          // that contain our zap request in the description
+          for await (const msg of nostr.req(
+            [{ kinds: [9735], authors: [lnurlPubkey], since: Math.floor(Date.now() / 1000) - 60 }],
+            { signal: abort.signal },
+          )) {
+            if (msg[0] === 'EVENT') {
+              const event = msg[2];
+              // Verify this zap receipt matches our zap request
+              const descriptionTag = event.tags.find(([name]: string[]) => name === 'description')?.[1];
+              if (descriptionTag) {
+                try {
+                  const embeddedZapRequest = JSON.parse(descriptionTag);
+                  if (embeddedZapRequest.id === zapRequestId) {
+                    onSettled();
+                    return;
+                  }
+                } catch {
+                  // Ignore parse errors
+                }
+              }
+            }
+          }
+        } catch {
+          // Subscription ended (abort or error) — ignore
         }
-      } catch {
-        // Ignore errors, keep polling
-      }
-
-      // Schedule next poll if still active
-      if (pollingRef.current && !cancelledRef.current) {
-        setTimeout(poll, POLL_INTERVAL_MS);
-      }
+      })();
     }
 
-    // Start first poll after a short delay (give payment time to propagate)
-    setTimeout(poll, 1000);
-  }, [stopPolling, onPaid]);
+    // Method 2: LUD-21 verify URL polling
+    if (gameInvoice.verifyUrl) {
+      const verifyUrl = gameInvoice.verifyUrl;
+
+      (async () => {
+        // Wait a moment before first poll
+        await new Promise((r) => setTimeout(r, 1500));
+
+        while (activeRef.current && !abort.signal.aborted) {
+          try {
+            const settled = await checkPaymentSettled(verifyUrl);
+            if (settled) {
+              onSettled();
+              return;
+            }
+          } catch {
+            // Ignore, keep polling
+          }
+          // Wait before next poll
+          await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+        }
+      })();
+    }
+  }, [nostr, stopVerification, onPaid]);
 
   const handleSubmitAddress = useCallback(async () => {
     const trimmed = lightningAddress.trim();
@@ -107,7 +163,8 @@ export function PaymentGate({ open, onPaid, onClose }: PaymentGateProps) {
     setLoading(true);
 
     try {
-      const gameInvoice = await getGameInvoice();
+      const relays = config.relayMetadata.relays.map((r) => r.url);
+      const gameInvoice = await getGameInvoice(relays);
       setInvoice(gameInvoice);
 
       // Generate QR code
@@ -122,23 +179,24 @@ export function PaymentGate({ open, onPaid, onClose }: PaymentGateProps) {
       if (isWebLNAvailable()) {
         const paid = await payWithWebLN(gameInvoice.bolt11);
         if (paid) {
-          onPaid(trimmed);
+          onPaid(trimmed, gameInvoice);
           return;
         }
       }
 
       setStep('invoice');
 
-      // Start polling the verify URL if available
-      if (gameInvoice.verifyUrl) {
-        startPolling(gameInvoice.verifyUrl, trimmed);
+      // Start verification (zap receipt sub + LUD-21 polling)
+      const hasVerification = gameInvoice.zapRequest || gameInvoice.verifyUrl;
+      if (hasVerification) {
+        startVerification(gameInvoice, trimmed);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to generate invoice');
     } finally {
       setLoading(false);
     }
-  }, [lightningAddress, onPaid, startPolling]);
+  }, [lightningAddress, config, onPaid, startVerification]);
 
   const handleCopyInvoice = useCallback(() => {
     if (!invoice) return;
@@ -147,7 +205,7 @@ export function PaymentGate({ open, onPaid, onClose }: PaymentGateProps) {
     setTimeout(() => setCopied(false), 2000);
   }, [invoice]);
 
-  const hasVerify = invoice?.verifyUrl != null;
+  const hasAnyVerification = invoice && (invoice.zapRequest || invoice.verifyUrl);
 
   return (
     <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
@@ -229,8 +287,7 @@ export function PaymentGate({ open, onPaid, onClose }: PaymentGateProps) {
               <p className="text-destructive text-xs">{error}</p>
             )}
 
-            {hasVerify && polling ? (
-              /* Payment verification is active — auto-detect when paid */
+            {hasAnyVerification && verifying ? (
               <div className="space-y-3">
                 <div className="flex items-center justify-center gap-2 py-3 rounded-md bg-secondary/30 border border-primary/10">
                   <Loader2 className="size-4 text-primary animate-spin" />
@@ -243,10 +300,9 @@ export function PaymentGate({ open, onPaid, onClose }: PaymentGateProps) {
                 </p>
               </div>
             ) : (
-              /* No verify URL or polling stopped — manual confirmation fallback */
               <>
                 <Button
-                  onClick={() => onPaid(lightningAddress.trim())}
+                  onClick={() => onPaid(lightningAddress.trim(), invoice)}
                   className="w-full bg-primary text-primary-foreground font-pixel text-xs hover:bg-primary/90 h-12"
                 >
                   I PAID — START GAME
