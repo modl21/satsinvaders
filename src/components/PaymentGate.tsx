@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { Zap, Copy, Check, Loader2 } from 'lucide-react';
 import qrcode from 'qrcode';
 
@@ -6,7 +6,8 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog';
 import { PAYMENT_AMOUNT_SATS, PAYMENT_RECIPIENT } from '@/lib/gameConstants';
-import { getGameInvoice, isWebLNAvailable, payWithWebLN } from '@/lib/lightning';
+import { getGameInvoice, isWebLNAvailable, payWithWebLN, checkPaymentSettled } from '@/lib/lightning';
+import type { GameInvoice } from '@/lib/lightning';
 
 interface PaymentGateProps {
   open: boolean;
@@ -14,28 +15,67 @@ interface PaymentGateProps {
   onClose: () => void;
 }
 
+const POLL_INTERVAL_MS = 2500;
+
 export function PaymentGate({ open, onPaid, onClose }: PaymentGateProps) {
   const [lightningAddress, setLightningAddress] = useState('');
   const [step, setStep] = useState<'address' | 'invoice'>('address');
-  const [invoice, setInvoice] = useState('');
+  const [invoice, setInvoice] = useState<GameInvoice | null>(null);
   const [qrDataUrl, setQrDataUrl] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [copied, setCopied] = useState(false);
-  const [webLNAttempted, setWebLNAttempted] = useState(false);
+  const [polling, setPolling] = useState(false);
+  const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const paidRef = useRef(false);
+
+  // Clean up polling on unmount or close
+  const stopPolling = useCallback(() => {
+    if (pollTimerRef.current) {
+      clearInterval(pollTimerRef.current);
+      pollTimerRef.current = null;
+    }
+    setPolling(false);
+  }, []);
 
   // Reset when opened
   useEffect(() => {
     if (open) {
       setStep('address');
-      setInvoice('');
+      setInvoice(null);
       setQrDataUrl('');
       setError('');
       setCopied(false);
-      setWebLNAttempted(false);
       setLoading(false);
+      setPolling(false);
+      paidRef.current = false;
+      stopPolling();
+    } else {
+      stopPolling();
     }
-  }, [open]);
+  }, [open, stopPolling]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => stopPolling();
+  }, [stopPolling]);
+
+  // Start polling for payment verification
+  const startPolling = useCallback((verifyUrl: string, address: string) => {
+    stopPolling();
+    setPolling(true);
+
+    pollTimerRef.current = setInterval(async () => {
+      if (paidRef.current) return;
+
+      const settled = await checkPaymentSettled(verifyUrl);
+      if (settled) {
+        paidRef.current = true;
+        stopPolling();
+        onPaid(address);
+      }
+    }, POLL_INTERVAL_MS);
+  }, [stopPolling, onPaid]);
 
   const handleSubmitAddress = useCallback(async () => {
     const trimmed = lightningAddress.trim();
@@ -48,21 +88,20 @@ export function PaymentGate({ open, onPaid, onClose }: PaymentGateProps) {
     setLoading(true);
 
     try {
-      const bolt11 = await getGameInvoice();
-      setInvoice(bolt11);
+      const gameInvoice = await getGameInvoice();
+      setInvoice(gameInvoice);
 
       // Generate QR code
-      const dataUrl = await qrcode.toDataURL(bolt11.toUpperCase(), {
+      const dataUrl = await qrcode.toDataURL(gameInvoice.bolt11.toUpperCase(), {
         width: 280,
         margin: 2,
         color: { dark: '#22c55e', light: '#0a0a0f' },
       });
       setQrDataUrl(dataUrl);
 
-      // Try WebLN auto-pay
-      if (isWebLNAvailable() && !webLNAttempted) {
-        setWebLNAttempted(true);
-        const paid = await payWithWebLN(bolt11);
+      // Try WebLN auto-pay first
+      if (isWebLNAvailable()) {
+        const paid = await payWithWebLN(gameInvoice.bolt11);
         if (paid) {
           onPaid(trimmed);
           return;
@@ -70,25 +109,26 @@ export function PaymentGate({ open, onPaid, onClose }: PaymentGateProps) {
       }
 
       setStep('invoice');
+
+      // Start polling the verify URL if available
+      if (gameInvoice.verifyUrl) {
+        startPolling(gameInvoice.verifyUrl, trimmed);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to generate invoice');
     } finally {
       setLoading(false);
     }
-  }, [lightningAddress, webLNAttempted, onPaid]);
+  }, [lightningAddress, onPaid, startPolling]);
 
   const handleCopyInvoice = useCallback(() => {
-    navigator.clipboard.writeText(invoice);
+    if (!invoice) return;
+    navigator.clipboard.writeText(invoice.bolt11);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   }, [invoice]);
 
-  const handlePaidConfirm = useCallback(() => {
-    const trimmed = lightningAddress.trim();
-    if (trimmed) {
-      onPaid(trimmed);
-    }
-  }, [lightningAddress, onPaid]);
+  const hasVerify = invoice?.verifyUrl != null;
 
   return (
     <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
@@ -140,7 +180,7 @@ export function PaymentGate({ open, onPaid, onClose }: PaymentGateProps) {
           </div>
         )}
 
-        {step === 'invoice' && (
+        {step === 'invoice' && invoice && (
           <div className="space-y-4 pt-2">
             {qrDataUrl && (
               <div className="flex justify-center">
@@ -153,7 +193,7 @@ export function PaymentGate({ open, onPaid, onClose }: PaymentGateProps) {
             <div className="flex gap-2">
               <Input
                 readOnly
-                value={invoice.substring(0, 32) + '...'}
+                value={invoice.bolt11.substring(0, 32) + '...'}
                 className="bg-secondary/50 border-primary/20 text-foreground text-xs font-mono"
               />
               <Button
@@ -170,16 +210,33 @@ export function PaymentGate({ open, onPaid, onClose }: PaymentGateProps) {
               <p className="text-destructive text-xs">{error}</p>
             )}
 
-            <Button
-              onClick={handlePaidConfirm}
-              className="w-full bg-primary text-primary-foreground font-pixel text-xs hover:bg-primary/90 h-12"
-            >
-              I PAID - START GAME
-            </Button>
-
-            <p className="text-[10px] text-center text-muted-foreground/50">
-              Scan with any Lightning wallet or copy the invoice
-            </p>
+            {hasVerify ? (
+              /* Payment verification is active — auto-detect when paid */
+              <div className="space-y-3">
+                <div className="flex items-center justify-center gap-2 py-3 rounded-md bg-secondary/30 border border-primary/10">
+                  <Loader2 className="size-4 text-primary animate-spin" />
+                  <span className="font-pixel text-[10px] text-primary tracking-wider">
+                    {polling ? 'WAITING FOR PAYMENT...' : 'VERIFYING...'}
+                  </span>
+                </div>
+                <p className="text-[10px] text-center text-muted-foreground/50">
+                  Pay the invoice &mdash; the game starts automatically once confirmed
+                </p>
+              </div>
+            ) : (
+              /* No verify URL — fallback to manual confirmation */
+              <>
+                <Button
+                  onClick={() => onPaid(lightningAddress.trim())}
+                  className="w-full bg-primary text-primary-foreground font-pixel text-xs hover:bg-primary/90 h-12"
+                >
+                  I PAID &mdash; START GAME
+                </Button>
+                <p className="text-[10px] text-center text-muted-foreground/50">
+                  Scan with any Lightning wallet, then confirm above
+                </p>
+              </>
+            )}
           </div>
         )}
       </DialogContent>

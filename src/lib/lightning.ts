@@ -11,7 +11,20 @@ interface LNURLPayResponse {
 
 interface LNURLInvoiceResponse {
   pr: string;
+  verify?: string;
   routes: string[];
+}
+
+export interface GameInvoice {
+  bolt11: string;
+  verifyUrl: string | null;
+}
+
+interface VerifyResponse {
+  status: string;
+  settled: boolean;
+  preimage: string | null;
+  pr: string;
 }
 
 /**
@@ -40,9 +53,10 @@ export async function resolveLightningAddress(address: string): Promise<LNURLPay
 }
 
 /**
- * Request an invoice from the LNURL-pay callback
+ * Request an invoice from the LNURL-pay callback.
+ * Returns the bolt11 invoice and an optional LUD-21 verify URL.
  */
-export async function requestInvoice(callback: string, amountMsat: number): Promise<string> {
+export async function requestInvoice(callback: string, amountMsat: number): Promise<GameInvoice> {
   const separator = callback.includes('?') ? '&' : '?';
   const url = `${callback}${separator}amount=${amountMsat}`;
   
@@ -58,13 +72,16 @@ export async function requestInvoice(callback: string, amountMsat: number): Prom
     throw new Error('No payment request in response');
   }
 
-  return data.pr;
+  return {
+    bolt11: data.pr,
+    verifyUrl: data.verify || null,
+  };
 }
 
 /**
  * Get an invoice for the game payment
  */
-export async function getGameInvoice(): Promise<string> {
+export async function getGameInvoice(): Promise<GameInvoice> {
   const lnurlPay = await resolveLightningAddress(PAYMENT_RECIPIENT);
   
   const amountMsat = PAYMENT_AMOUNT_SATS * 1000;
@@ -77,6 +94,22 @@ export async function getGameInvoice(): Promise<string> {
   }
 
   return requestInvoice(lnurlPay.callback, amountMsat);
+}
+
+/**
+ * Poll a LUD-21 verify URL to check if an invoice has been settled.
+ * Returns true if the payment is confirmed, false otherwise.
+ */
+export async function checkPaymentSettled(verifyUrl: string): Promise<boolean> {
+  try {
+    const response = await fetch(`${CORS_PROXY}${encodeURIComponent(verifyUrl)}`);
+    if (!response.ok) return false;
+
+    const data = await response.json() as VerifyResponse;
+    return data.settled === true;
+  } catch {
+    return false;
+  }
 }
 
 /**
