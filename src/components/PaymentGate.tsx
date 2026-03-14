@@ -212,7 +212,7 @@ export function PaymentGate({ open, onPaid, onClose }: PaymentGateProps) {
               className="mx-auto inline-flex items-center gap-2 rounded-md border border-primary/30 bg-primary/10 px-3 py-2 text-[11px] font-pixel tracking-wide text-primary hover:bg-primary/20 transition-colors"
             >
               <Wallet className="size-3.5" />
-              NEED A LIGHTNING WALLET? GET PRIMAL
+              NEED A LIGHTNING WALLET?
             </a>
 
             <DialogDescription className="text-center text-muted-foreground text-sm">

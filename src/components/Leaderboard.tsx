@@ -70,7 +70,7 @@ function LeaderboardRow({ entry, rank }: { entry: LeaderboardEntry; rank: number
       <div className="flex-1 min-w-0">
         {nip05 ? (
           <a
-            href={`https://njump.me/${nip05.npub}`}
+            href={`https://primal.net/p/${nip05.npub}`}
             target="_blank"
             rel="noopener noreferrer"
             className="flex items-center gap-1 group min-w-0"
