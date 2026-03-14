@@ -1,5 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { Zap, Copy, Check, Loader2 } from 'lucide-react';
+import { Zap, Copy, Check, Loader2, HelpCircle } from 'lucide-react';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import { cn } from '@/lib/utils';
 import { useNostr } from '@nostrify/react';
 import qrcode from 'qrcode';
 
@@ -199,9 +201,30 @@ export function PaymentGate({ open, onPaid, onClose }: PaymentGateProps) {
         onInteractOutside={(e) => { if (step === 'invoice') e.preventDefault(); }}
       >
         <DialogHeader>
-          <DialogTitle className="font-pixel text-sm text-primary text-center tracking-wider">
-            INSERT COIN
-          </DialogTitle>
+          <div className="flex items-center justify-center gap-2">
+            <DialogTitle className="font-pixel text-sm text-primary text-center tracking-wider">
+              INSERT COIN
+            </DialogTitle>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <a
+                  href="https://primal.net/downloads"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  aria-label="Need a Lightning wallet?"
+                  className={cn(
+                    'inline-flex items-center justify-center rounded-full text-muted-foreground/70 hover:text-primary transition-colors',
+                    'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0a0a0f]'
+                  )}
+                >
+                  <HelpCircle className="size-4" />
+                </a>
+              </TooltipTrigger>
+              <TooltipContent side="top" className="font-pixel text-[10px] tracking-wide">
+                Need a lightning wallet?
+              </TooltipContent>
+            </Tooltip>
+          </div>
           <DialogDescription className="text-center text-muted-foreground text-sm">
             Pay {PAYMENT_AMOUNT_SATS} sats to {PAYMENT_RECIPIENT} for 1 life
           </DialogDescription>
