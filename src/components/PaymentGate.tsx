@@ -225,9 +225,9 @@ export function PaymentGate({ open, onPaid, onClose }: PaymentGateProps) {
               NEED A LIGHTNING WALLET?
             </a>
 
-            <DialogDescription className="text-center text-muted-foreground text-sm">
-              Pay {PAYMENT_AMOUNT_SATS} sats to {PAYMENT_RECIPIENT} for 1 life
-            </DialogDescription>
+          <DialogDescription className="text-center text-muted-foreground text-sm font-pixel tracking-wide">
+            ZAP {PAYMENT_AMOUNT_SATS} SATS FOR ONE LIFE
+          </DialogDescription>
           </div>
         </DialogHeader>
 
