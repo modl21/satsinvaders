@@ -1,18 +1,16 @@
-// Fix GameCanvas.tsx logic: keysRef check logic was clearing it too agressively or not correctly.
-// Also update TouchControls logic.
 import { useRef, useEffect, useCallback, useState } from 'react';
 
-import { createInitialState, updateGame, changeDirection } from '@/lib/gameEngine';
+import { createInitialState, updateGame } from '@/lib/gameEngine';
 import { renderGame } from '@/lib/gameRenderer';
 import { GAME_WIDTH, GAME_HEIGHT } from '@/lib/gameConstants';
-import type { GameState, Direction } from '@/lib/gameTypes';
+import type { GameState } from '@/lib/gameTypes';
 
 interface GameCanvasProps {
   onGameOver: (score: number) => void;
   isPlaying: boolean;
   isMobile: boolean;
   /** Shared ref so external touch controls can drive input */
-  keysRef: React.MutableRefObject<Direction | null>;
+  keysRef: React.MutableRefObject<{ left: boolean; right: boolean; shoot: boolean }>;
 }
 
 export function GameCanvas({ onGameOver, isPlaying, isMobile, keysRef }: GameCanvasProps) {
@@ -23,73 +21,61 @@ export function GameCanvas({ onGameOver, isPlaying, isMobile, keysRef }: GameCan
   const gameOverCalledRef = useRef(false);
   const [canvasScale, setCanvasScale] = useState(1);
 
-  // Calculate scale to fit screen
+  // Calculate scale to fit screen — reserve space for fixed touch controls on mobile
   useEffect(() => {
     function handleResize() {
-      // Base game is 400x400
-      const maxW = Math.min(window.innerWidth - 32, 600);
-      const reserveBottom = isMobile ? 320 : 60; // MORE space for touch controls
-      const reserveTop = 100;
-
-      const availH = window.innerHeight - reserveTop - reserveBottom;
-      
+      const maxW = Math.min(window.innerWidth - 16, 500);
+      // When playing on mobile, reserve 130px at the bottom for touch controls
+      // Title/header takes ~120px at the top
+      const reserveBottom = isMobile ? 130 : 0;
+      const reserveTop = 120;
+      const maxH = window.innerHeight - reserveTop - reserveBottom;
       const scaleW = maxW / GAME_WIDTH;
-      const scaleH = availH / GAME_HEIGHT;
-      
-      let scale = Math.min(scaleW, scaleH);
-      if (scale < 0.5) scale = 0.5;
-      
-      // On desktop, limit max size
-      if (!isMobile && scale > 1.5) scale = 1.5;
-
-      setCanvasScale(scale);
+      const scaleH = maxH / GAME_HEIGHT;
+      setCanvasScale(Math.min(scaleW, scaleH, 1.5));
     }
     handleResize();
     window.addEventListener('resize', handleResize);
     return () => window.removeEventListener('resize', handleResize);
   }, [isMobile]);
 
-  // Reset game function
-  const resetGame = useCallback(() => {
+  // Reset game when isPlaying changes to true
+  useEffect(() => {
     if (isPlaying) {
       gameStateRef.current = createInitialState();
       gameOverCalledRef.current = false;
-      keysRef.current = null;
+      keysRef.current = { left: false, right: false, shoot: false };
     }
   }, [isPlaying, keysRef]);
-
-  // Initial reset
-  useEffect(() => {
-    resetGame();
-  }, [resetGame]);
 
   // Keyboard controls
   useEffect(() => {
     if (!isPlaying) return;
 
     function handleKeyDown(e: KeyboardEvent) {
-      // Prevent default scrolling for arrows
-      if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' '].includes(e.key)) {
+      if (e.key === 'ArrowLeft' || e.key === 'a') keysRef.current.left = true;
+      if (e.key === 'ArrowRight' || e.key === 'd') keysRef.current.right = true;
+      if (e.key === ' ' || e.key === 'ArrowUp') {
         e.preventDefault();
-      }
-
-      let newDir: Direction | null = null;
-      if (e.key === 'ArrowUp' || e.key === 'w') newDir = 'up';
-      if (e.key === 'ArrowDown' || e.key === 's') newDir = 'down';
-      if (e.key === 'ArrowLeft' || e.key === 'a') newDir = 'left';
-      if (e.key === 'ArrowRight' || e.key === 'd') newDir = 'right';
-
-      if (newDir) {
-        // Apply direction immediately to current state
-        gameStateRef.current = changeDirection(gameStateRef.current, newDir);
+        keysRef.current.shoot = true;
       }
     }
 
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isPlaying]);
+    function handleKeyUp(e: KeyboardEvent) {
+      if (e.key === 'ArrowLeft' || e.key === 'a') keysRef.current.left = false;
+      if (e.key === 'ArrowRight' || e.key === 'd') keysRef.current.right = false;
+      if (e.key === ' ' || e.key === 'ArrowUp') keysRef.current.shoot = false;
+    }
 
-  // Game Loop
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+    };
+  }, [isPlaying, keysRef]);
+
+  // Game loop
   const gameLoop = useCallback(() => {
     if (!isPlaying) return;
 
@@ -98,17 +84,11 @@ export function GameCanvas({ onGameOver, isPlaying, isMobile, keysRef }: GameCan
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    // Check touch controls once per frame
-    if (keysRef.current) {
-      gameStateRef.current = changeDirection(gameStateRef.current, keysRef.current);
-      // Clear specific key press to avoid spam (though changeDirection handles invalid moves)
-      keysRef.current = null; 
-    }
-
+    const now = performance.now();
     const state = gameStateRef.current;
 
     if (!state.gameOver) {
-      gameStateRef.current = updateGame(state);
+      gameStateRef.current = updateGame(state, keysRef.current, now);
     } else if (!gameOverCalledRef.current) {
       gameOverCalledRef.current = true;
       onGameOver(state.score);
@@ -120,55 +100,45 @@ export function GameCanvas({ onGameOver, isPlaying, isMobile, keysRef }: GameCan
     animFrameRef.current = requestAnimationFrame(gameLoop);
   }, [isPlaying, onGameOver, keysRef]);
 
-  // Start/Stop Loop
   useEffect(() => {
     if (isPlaying) {
       animFrameRef.current = requestAnimationFrame(gameLoop);
-    } else {
-      if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
     }
     return () => {
-      if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+      if (animFrameRef.current) {
+        cancelAnimationFrame(animFrameRef.current);
+      }
     };
   }, [isPlaying, gameLoop]);
 
-  // Idle Animation Loop (only when NOT playing)
+  // Render idle animation when not playing
   useEffect(() => {
     if (isPlaying) return;
-    
+
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
     let frame = 0;
-    // We keep a consistent idle state so tumbleweeds don't reset every frame
-    let idleState = createInitialState(); 
-    let idleAnimRequest: number;
+    let idleState = createInitialState();
+    let idleAnimFrame: number;
 
     function animateIdle() {
       frame++;
-      
-      // Animate background elements
       idleState = {
         ...idleState,
-        tickCount: frame,
-        screenShake: Math.sin(frame * 0.005) * 1.5,
-        tumbleweeds: idleState.tumbleweeds.map((tw) => ({
-            ...tw,
-            x: (tw.x + tw.speed) % (GAME_WIDTH * 16 + 100) - 50,
-            rotation: tw.rotation + tw.speed * 0.05,
-        }))
+        stars: idleState.stars.map((star) => ({
+          ...star,
+          y: (star.y + star.speed) % GAME_HEIGHT,
+        })),
       };
-
-      if (!isPlaying) {
-        renderGame(ctx!, idleState, frame);
-        idleAnimRequest = requestAnimationFrame(animateIdle);
-      }
+      renderGame(ctx!, idleState, frame);
+      idleAnimFrame = requestAnimationFrame(animateIdle);
     }
 
-    idleAnimRequest = requestAnimationFrame(animateIdle);
-    return () => cancelAnimationFrame(idleAnimRequest);
+    idleAnimFrame = requestAnimationFrame(animateIdle);
+    return () => cancelAnimationFrame(idleAnimFrame);
   }, [isPlaying]);
 
   return (
@@ -176,11 +146,10 @@ export function GameCanvas({ onGameOver, isPlaying, isMobile, keysRef }: GameCan
       ref={canvasRef}
       width={GAME_WIDTH}
       height={GAME_HEIGHT}
-      className="block mx-auto rounded-lg shadow-[0_0_40px_rgba(255,69,0,0.15)] border-4 border-[#3d2b1f] bg-[#1a0f0a]"
+      className="game-canvas rounded-lg border border-primary/20 shadow-[0_0_30px_rgba(34,197,94,0.15)]"
       style={{
-        width: `${GAME_WIDTH * canvasScale}px`,
-        height: `${GAME_HEIGHT * canvasScale}px`,
-        imageRendering: 'pixelated',
+        width: GAME_WIDTH * canvasScale,
+        height: GAME_HEIGHT * canvasScale,
       }}
     />
   );

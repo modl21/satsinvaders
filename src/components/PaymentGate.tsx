@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { Zap, Copy, Check, Loader2, Wallet, X } from 'lucide-react';
+import { Zap, Copy, Check, Loader2, Wallet } from 'lucide-react';
 import { useNostr } from '@nostrify/react';
 import qrcode from 'qrcode';
 
@@ -30,7 +30,6 @@ export function PaymentGate({ open, onPaid, onClose }: PaymentGateProps) {
   const [error, setError] = useState('');
   const [copied, setCopied] = useState(false);
   const [verifying, setVerifying] = useState(false);
-  const [timeLeft, setTimeLeft] = useState(120); // 2 minute countdown for invoice
 
   const activeRef = useRef(false);
 
@@ -48,7 +47,6 @@ export function PaymentGate({ open, onPaid, onClose }: PaymentGateProps) {
       setCopied(false);
       setLoading(false);
       stopVerification();
-      setTimeLeft(120);
     } else {
       stopVerification();
     }
@@ -58,7 +56,19 @@ export function PaymentGate({ open, onPaid, onClose }: PaymentGateProps) {
     return () => { activeRef.current = false; };
   }, []);
 
-  // Poll for zap receipt
+  /**
+   * Poll Nostr relays for a kind 9735 zap receipt that matches our zap request.
+   *
+   * Per NIP-57, the zap receipt:
+   *  - has kind 9735
+   *  - MUST include a `p` tag with the recipient pubkey
+   *  - MUST include a `P` tag with the sender (zap requester) pubkey
+   *  - MUST include a `description` tag with the JSON of our zap request
+   *  - MUST include a `bolt11` tag with the invoice
+   *
+   * We filter by #p (recipient) to narrow the search, then match by bolt11 or
+   * by the zap request id inside the description tag.
+   */
   const startVerification = useCallback((gameInvoice: GameInvoice, address: string) => {
     stopVerification();
     activeRef.current = true;
@@ -77,6 +87,9 @@ export function PaymentGate({ open, onPaid, onClose }: PaymentGateProps) {
     const zapRequestId = gameInvoice.zapRequest!.id;
     const bolt11 = gameInvoice.bolt11;
 
+    // Query strategy for primal zap receipts:
+    // 1) strict filter with both recipient (#p) and sender (#P) when available
+    // 2) fallback filter with recipient only (#p)
     const filters = senderPubkey
       ? [
           { kinds: [9735], '#p': [recipientPubkey], '#P': [senderPubkey], since: sinceTimestamp, limit: 30 },
@@ -90,6 +103,7 @@ export function PaymentGate({ open, onPaid, onClose }: PaymentGateProps) {
       if (!activeRef.current) return;
 
       try {
+        // Query both default relay pool + primal relay directly for fastest detection
         const [poolEvents, primalEvents] = await Promise.all([
           nostr.query(filters, { signal: AbortSignal.timeout(8000) }),
           nostr.relay('wss://relay.primal.net').query(filters, { signal: AbortSignal.timeout(8000) }),
@@ -98,12 +112,14 @@ export function PaymentGate({ open, onPaid, onClose }: PaymentGateProps) {
         const allEvents = [...poolEvents, ...primalEvents];
 
         for (const event of allEvents) {
+          // Match 1: bolt11 tag matches our invoice exactly
           const bolt11Tag = event.tags.find(([n]) => n === 'bolt11')?.[1];
           if (bolt11Tag === bolt11) {
             onSettled();
             return;
           }
 
+          // Match 2: description tag contains our zap request
           const descTag = event.tags.find(([n]) => n === 'description')?.[1];
           if (descTag) {
             try {
@@ -112,23 +128,28 @@ export function PaymentGate({ open, onPaid, onClose }: PaymentGateProps) {
                 onSettled();
                 return;
               }
-            } catch { /* skip */ }
+            } catch {
+              // skip malformed
+            }
           }
         }
-      } catch { /* ignore */ }
+      } catch {
+        // query failed, will retry
+      }
 
       if (activeRef.current) {
         setTimeout(poll, POLL_INTERVAL_MS);
       }
     }
 
+    // First poll after a short delay to allow payment propagation
     setTimeout(poll, 3000);
   }, [nostr, stopVerification, onPaid]);
 
   const handleSubmitAddress = useCallback(async () => {
     const trimmed = lightningAddress.trim();
     if (!trimmed || !trimmed.includes('@')) {
-      setError('Enter a valid address (e.g. name@wallet.com)');
+      setError('Please enter a valid lightning address (e.g. you@wallet.com)');
       return;
     }
 
@@ -141,16 +162,17 @@ export function PaymentGate({ open, onPaid, onClose }: PaymentGateProps) {
       setInvoice(gameInvoice);
 
       const dataUrl = await qrcode.toDataURL(gameInvoice.bolt11.toUpperCase(), {
-        width: 300,
+        width: 280,
         margin: 2,
-        color: { dark: '#c4813d', light: '#1a0f0a' },
+        color: { dark: '#22c55e', light: '#0a0a0f' },
       });
       setQrDataUrl(dataUrl);
 
-      // WebLN check
+      // Try WebLN auto-pay first
       if (isWebLNAvailable()) {
         const paid = await payWithWebLN(gameInvoice.bolt11);
         if (paid) {
+          // WebLN paid — still wait for zap receipt to verify
           startVerification(gameInvoice, trimmed);
           setStep('invoice');
           return;
@@ -160,8 +182,7 @@ export function PaymentGate({ open, onPaid, onClose }: PaymentGateProps) {
       setStep('invoice');
       startVerification(gameInvoice, trimmed);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Services unavailable. Try again.');
-      // Keep loading false on error so they can retry
+      setError(err instanceof Error ? err.message : 'Failed to generate invoice');
     } finally {
       setLoading(false);
     }
@@ -174,91 +195,86 @@ export function PaymentGate({ open, onPaid, onClose }: PaymentGateProps) {
     setTimeout(() => setCopied(false), 2000);
   }, [invoice]);
 
+  // Only allow closing on the address step — once an invoice is shown, lock the dialog
   const handleOpenChange = useCallback((o: boolean) => {
-    if (!o && step === 'invoice') return;
+    if (!o && step === 'invoice') return; // blocked
     if (!o) onClose();
   }, [step, onClose]);
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent
-        className={`bg-[#0a0502] border-2 border-[#8b4513] max-w-sm mx-auto shadow-[0_0_50px_rgba(139,69,19,0.2)] ${step === 'invoice' ? '[&>button:last-of-type]:hidden' : ''}`}
+        className={`bg-[#0a0a0f] border-primary/30 max-w-sm mx-auto ${step === 'invoice' ? '[&>button:last-of-type]:hidden' : ''}`}
         onEscapeKeyDown={(e) => { if (step === 'invoice') e.preventDefault(); }}
         onInteractOutside={(e) => { if (step === 'invoice') e.preventDefault(); }}
       >
         <DialogHeader>
-          <div className="space-y-4">
-            <DialogTitle className="font-pixel text-sm text-[#c4813d] text-center tracking-widest uppercase">
-              COIN SLOT
+          <div className="space-y-3">
+            <DialogTitle className="font-pixel text-sm text-primary text-center tracking-wider">
+              INSERT COIN
             </DialogTitle>
 
+            {/* Explicit visible wallet CTA */}
             <a
               href="https://primal.net/downloads"
               target="_blank"
               rel="noopener noreferrer"
-              className="mx-auto inline-flex items-center gap-2 rounded border border-[#8b4513]/30 bg-[#2c1e16]/50 px-3 py-2 text-[10px] font-pixel tracking-wide text-[#c4a882] hover:bg-[#3d2b1f] hover:text-[#eecfa1] transition-colors"
+              className="mx-auto inline-flex items-center gap-2 rounded-md border border-primary/30 bg-primary/10 px-3 py-2 text-[11px] font-pixel tracking-wide text-primary hover:bg-primary/20 transition-colors"
             >
-              <Wallet className="size-3" />
-              GET LIGHTNING WALLET
+              <Wallet className="size-3.5" />
+              NEED A LIGHTNING WALLET?
             </a>
 
-            <DialogDescription className="text-center text-[#8b6914] text-xs font-pixel tracking-wider uppercase">
-              PAY {PAYMENT_AMOUNT_SATS} SATS TO PLAY
-            </DialogDescription>
+          <DialogDescription className="text-center text-muted-foreground text-sm font-pixel tracking-wide">
+            ZAP {PAYMENT_AMOUNT_SATS} SATS FOR ONE LIFE
+          </DialogDescription>
           </div>
         </DialogHeader>
 
         {step === 'address' && (
-          <div className="space-y-5 pt-2">
+          <div className="space-y-4 pt-2">
             <div className="space-y-2">
-              <label className="text-[10px] text-[#8b4513] font-pixel tracking-widest uppercase block mb-1">
-                LIGHTNING ADDRESS
+              <label className="text-xs text-muted-foreground font-pixel tracking-wider">
+                YOUR LIGHTNING ADDRESS
               </label>
               <Input
-                placeholder="satoshi@primal.net"
+                placeholder="you@wallet.com"
                 value={lightningAddress}
                 onChange={(e) => setLightningAddress(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && handleSubmitAddress()}
-                className="bg-[#1a0f0a] border-[#8b4513]/50 text-[#eecfa1] placeholder:text-[#8b4513]/40 focus:border-[#c4813d] h-12 font-mono text-sm"
+                className="bg-secondary/50 border-primary/20 text-foreground placeholder:text-muted-foreground/50 focus:border-primary/50"
                 autoFocus
               />
-              <p className="text-[9px] text-[#8b4513]/60 italic pl-1">
-                Required for payout on the bounty board
+              <p className="text-[10px] text-muted-foreground/60">
+                Your address goes on the leaderboard if you make the top 10
               </p>
             </div>
 
             {error && (
-              <div className="p-3 bg-destructive/10 border border-destructive/20 rounded text-destructive text-xs font-pixel">
-                {error}
-              </div>
+              <p className="text-destructive text-xs font-pixel">{error}</p>
             )}
 
             <Button
               onClick={handleSubmitAddress}
               disabled={loading || !lightningAddress.trim()}
-              className="w-full bg-[#c4813d] text-[#2c1e16] font-pixel text-xs hover:bg-[#d4a854] h-12 border-b-4 border-[#8b4513] active:border-b-0 active:translate-y-[4px] transition-all"
+              className="w-full bg-primary text-primary-foreground font-pixel text-xs hover:bg-primary/90 h-12"
             >
               {loading ? (
-                <div className="flex items-center gap-2">
-                  <Loader2 className="size-4 animate-spin" />
-                  <span>FORGING INVOICE...</span>
-                </div>
+                <Loader2 className="size-4 animate-spin mr-2" />
               ) : (
-                <div className="flex items-center gap-2">
-                  <Zap className="size-4" />
-                  <span>INSERT {PAYMENT_AMOUNT_SATS} SATS</span>
-                </div>
+                <Zap className="size-4 mr-2" />
               )}
+              {loading ? 'GENERATING INVOICE...' : `ZAP ${PAYMENT_AMOUNT_SATS} SATS`}
             </Button>
           </div>
         )}
 
         {step === 'invoice' && invoice && (
-          <div className="space-y-4 pt-2 animate-in fade-in zoom-in-95 duration-300">
+          <div className="space-y-4 pt-2">
             {qrDataUrl && (
-              <div className="flex justify-center my-2">
-                <div className="p-3 rounded bg-[#1a0f0a] border-2 border-[#c4813d]/30 shadow-[0_0_20px_rgba(196,129,61,0.1)]">
-                  <img src={qrDataUrl} alt="Lightning Invoice QR" className="w-[240px] h-[240px] opacity-90" />
+              <div className="flex justify-center">
+                <div className="p-2 rounded-lg border border-primary/20 bg-[#0a0a0f]">
+                  <img src={qrDataUrl} alt="Lightning Invoice QR" className="w-[280px] h-[280px]" />
                 </div>
               </div>
             )}
@@ -266,35 +282,33 @@ export function PaymentGate({ open, onPaid, onClose }: PaymentGateProps) {
             <div className="flex gap-2">
               <Input
                 readOnly
-                value={invoice.bolt11}
-                className="bg-[#1a0f0a] border-[#8b4513]/30 text-[#8b6914] text-[10px] font-mono h-9 truncate"
+                value={invoice.bolt11.substring(0, 32) + '...'}
+                className="bg-secondary/50 border-primary/20 text-foreground text-xs font-mono"
               />
               <Button
                 onClick={handleCopyInvoice}
                 variant="outline"
                 size="icon"
-                className="border-[#8b4513]/30 bg-[#2c1e16] text-[#c4813d] hover:bg-[#3d2b1f] shrink-0 size-9"
+                className="border-primary/20 shrink-0"
               >
-                {copied ? <Check className="size-4" /> : <Copy className="size-4" />}
+                {copied ? <Check className="size-4 text-primary" /> : <Copy className="size-4" />}
               </Button>
             </div>
 
-            <div className="space-y-3 pt-2">
-              <div className="flex items-center justify-center gap-3 py-3 rounded bg-[#2c1e16]/30 border border-[#c4813d]/20">
-                <Loader2 className="size-4 text-[#c4813d] animate-spin" />
-                <span className="font-pixel text-[10px] text-[#c4813d] tracking-widest uppercase animate-pulse">
-                  AWAITING DEPOSIT...
+            {error && (
+              <p className="text-destructive text-xs">{error}</p>
+            )}
+
+            <div className="space-y-3">
+              <div className="flex items-center justify-center gap-2 py-3 rounded-md bg-secondary/30 border border-primary/10">
+                <Loader2 className="size-4 text-primary animate-spin" />
+                <span className="font-pixel text-[10px] text-primary tracking-wider">
+                  {verifying ? 'WAITING FOR PAYMENT...' : 'PREPARING...'}
                 </span>
               </div>
-              
-              <div className="text-center">
-                 <button 
-                   onClick={() => { setStep('address'); stopVerification(); }}
-                   className="text-[10px] text-[#8b4513] hover:text-[#c4813d] underline decoration-dotted underline-offset-4"
-                 >
-                   Cancel and return
-                 </button>
-              </div>
+                <p className="text-[10px] text-center text-muted-foreground/50">
+                  Zap the invoice — the game starts automatically once confirmed
+                </p>
             </div>
           </div>
         )}
